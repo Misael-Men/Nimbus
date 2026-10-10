@@ -24,7 +24,9 @@ import sys
 import tarfile
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -32,6 +34,8 @@ SCREEN_NAME = "mc"
 WORLD_DIRS = ("world", "world_nether", "world_the_end")
 HISTORY_LEN = 150  # samples kept for the charts (2 s apart = 5 minutes)
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+TUNNEL_URL_RE = re.compile(r"https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com")
+WEBHOOK_RE = re.compile(r"^https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w-]+$")
 BACKUP_NAME_RE = re.compile(r"^world-\d{8}-\d{6}\.tar\.gz$")
 
 MC_DIR = Path.home() / "minecraft"
@@ -550,7 +554,9 @@ class Monitor:
         with self.lock:
             return {**self.snapshot, "history": {k: list(v) for k, v in self.history.items()},
                     "task": dict(self.task),
-                    "public": {"port": PUBLIC_PORT, "join_address": load_settings().get("join_address", "")}}
+                    "public": {"port": PUBLIC_PORT, "join_address": load_settings().get("join_address", ""),
+                               "url": TUNNEL.url, "tunnel": TUNNEL.status, "discord": TUNNEL.discord,
+                               "webhook_set": bool(load_settings().get("discord_webhook"))}}
 
     def public_status(self):
         """What the shareable page shows: no paths, IPs, console or controls."""
@@ -715,6 +721,73 @@ def read_console(offset):
 
 # ---------------------------------------------------------------- http
 
+def post_to_discord(webhook, text):
+    data = json.dumps({"content": text, "allowed_mentions": {"parse": []}}).encode()
+    req = urllib.request.Request(webhook, data=data, method="POST", headers={
+        "Content-Type": "application/json", "User-Agent": "Nimbus (minecraft dashboard, 1.0)"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return resp.status
+
+
+class Tunnel:
+    """Runs a Cloudflare quick tunnel to the public page and announces each new link on Discord."""
+
+    def __init__(self):
+        self.url = None
+        self.status = "off"
+        self.discord = ""
+
+    def announce(self, test=False):
+        settings = load_settings()
+        webhook = settings.get("discord_webhook")
+        if not webhook:
+            raise RuntimeError("No Discord webhook saved.")
+        if not self.url:
+            raise RuntimeError("The public link isn't ready yet.")
+        lines = [f"**Server status page:** {self.url}"]
+        if settings.get("join_address"):
+            lines.append(f"**Join address:** `{settings['join_address']}`")
+        if test:
+            lines.append("_(test message from Nimbus)_")
+        post_to_discord(webhook, "\n".join(lines))
+
+    def _announce_new(self):
+        settings = load_settings()
+        if not settings.get("discord_webhook") or settings.get("last_announced_url") == self.url:
+            return
+        try:
+            self.announce()
+            settings = load_settings()
+            settings["last_announced_url"] = self.url
+            save_settings(settings)
+            self.discord = "Posted the new link to Discord."
+        except (OSError, urllib.error.URLError, RuntimeError) as exc:
+            self.discord = f"Couldn't post to Discord: {exc}"
+
+    def run(self, port):
+        binary = shutil.which("cloudflared")
+        if not binary:
+            self.status = "cloudflared isn't installed"
+            return
+        while True:
+            self.status, self.url = "connecting", None
+            try:
+                proc = subprocess.Popen([binary, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                for line in proc.stderr:
+                    match = TUNNEL_URL_RE.search(line)
+                    if match and match.group(0) != self.url:
+                        self.url, self.status = match.group(0), "online"
+                        self._announce_new()
+                proc.wait()
+            except OSError as exc:
+                self.status = f"failed to start: {exc}"
+            self.url = None
+            self.status = "reconnecting"
+            time.sleep(15)
+
+
+TUNNEL = Tunnel()
 MONITOR = Monitor()
 
 
@@ -811,10 +884,24 @@ class Handler(BaseHTTPRequestHandler):
                 msg = f"Sent: {command}"
             elif url.path == "/api/settings":
                 settings = load_settings()
-                address = str(body.get("join_address", "")).strip()[:200]
-                settings["join_address"] = address
+                if "join_address" in body:
+                    settings["join_address"] = str(body["join_address"]).strip()[:200]
+                if "discord_webhook" in body:
+                    webhook = str(body["discord_webhook"]).strip()
+                    if webhook and not WEBHOOK_RE.match(webhook):
+                        raise RuntimeError("That doesn't look like a Discord webhook URL.")
+                    settings["discord_webhook"] = webhook
+                    settings.pop("last_announced_url", None)
                 save_settings(settings)
+                if settings.get("discord_webhook") and TUNNEL.url:
+                    threading.Thread(target=TUNNEL._announce_new, daemon=True).start()
                 msg = "Saved."
+            elif url.path == "/api/discord/test":
+                try:
+                    TUNNEL.announce(test=True)
+                except urllib.error.URLError as exc:
+                    raise RuntimeError(f"Discord didn't accept it: {exc}") from exc
+                msg = "Sent to Discord."
             elif url.path == "/api/backup":
                 MONITOR.backup()
                 msg = "Backup started…"
@@ -913,6 +1000,7 @@ def main():
     parser.add_argument("--mc-dir", default=str(Path.home() / "minecraft"))
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--public-port", type=int, default=8766, help="read-only page for friends (0 = off)")
+    parser.add_argument("--no-tunnel", action="store_true", help="don't create a public Cloudflare link")
     parser.add_argument("--install", action="store_true", help="install as a systemd service (use sudo)")
     parser.add_argument("--token", action="store_true", help="print the access token and exit")
     args = parser.parse_args()
@@ -941,6 +1029,8 @@ def main():
         try:
             serve(PUBLIC_PORT, PublicHandler)
             print(f"Public page on http://{lan_ip()}:{PUBLIC_PORT}", flush=True)
+            if not args.no_tunnel:
+                threading.Thread(target=TUNNEL.run, args=(PUBLIC_PORT,), daemon=True).start()
         except OSError as exc:
             print(f"Couldn't open the public page on port {PUBLIC_PORT}: {exc}", flush=True)
     server = serve(args.port, Handler)
@@ -1158,7 +1248,13 @@ details summary { cursor: pointer; color: var(--muted); margin-top: 8px; }
       <h2>Page for friends</h2>
       <div class="sub">A read-only page with server status, players and performance. No controls, console, or system details.</div>
       <form class="cmd" id="publicForm"><input type="text" id="joinAddress" placeholder="Address friends join with, e.g. something.joinmc.link"><button class="primary">Save</button></form>
-      <div class="btns"><a id="publicLink" target="_blank" rel="noopener"><button type="button">Open page</button></a><span class="sub" id="publicUrl" style="align-self:center"></span></div>
+      <div class="row" style="margin-top:12px"><span>Public link</span><span id="tunnelUrl">–</span></div>
+      <div class="row"><span>On your network</span><span id="publicUrl">–</span></div>
+      <div class="btns"><button type="button" id="copyTunnel">Copy public link</button><a id="publicLink" target="_blank" rel="noopener"><button type="button">Open page</button></a></div>
+      <h2 style="margin-top:18px">Discord</h2>
+      <div class="sub">Posts the public link to a channel whenever it changes. In Discord: channel settings → Integrations → Webhooks → New Webhook → Copy Webhook URL.</div>
+      <form class="cmd" id="webhookForm"><input type="password" id="webhook" placeholder="Paste webhook URL" autocomplete="off"><button class="primary">Save</button><button type="button" id="testDiscord">Send test</button><button type="button" class="danger" id="removeWebhook">Remove</button></form>
+      <div class="sub" id="discordStatus" style="margin-top:8px"></div>
     </section>
 
     <section class="card wide">
@@ -1243,7 +1339,11 @@ function render(s) {
   $('host').textContent = s.hostname || '';
   if (s.public) {
     const url = s.public.port ? `${location.protocol}//${location.hostname}:${s.public.port}/` : '';
-    $('publicLink').href = url; $('publicUrl').textContent = url ? `On your network: ${url}` : 'Turned off';
+    $('publicLink').href = s.public.url || url; $('publicUrl').textContent = url || 'Turned off';
+    $('tunnelUrl').textContent = s.public.url || s.public.tunnel; $('copyTunnel').disabled = !s.public.url;
+    $('webhook').placeholder = s.public.webhook_set ? 'Webhook saved. Paste a new one to replace it' : 'Paste webhook URL';
+    $('testDiscord').disabled = $('removeWebhook').disabled = !s.public.webhook_set;
+    $('discordStatus').textContent = s.public.discord || '';
     if (document.activeElement !== $('joinAddress') && !render.joinLoaded) { $('joinAddress').value = s.public.join_address || ''; render.joinLoaded = true; }
   }
   $('updated').textContent = 'Updated ' + new Date(s.time * 1000).toLocaleTimeString();
@@ -1391,6 +1491,10 @@ $('btnRestart').onclick = () => act('/api/server/restart', null, 'Restart the se
 $('btnKill').onclick = () => act('/api/server/kill', null, 'Force kill the server process? Anything not saved will be lost. Only use this if the server is frozen.');
 $('btnBackup').onclick = () => act('/api/backup');
 $('publicForm').onsubmit = e => { e.preventDefault(); act('/api/settings', { join_address: $('joinAddress').value }); };
+$('webhookForm').onsubmit = e => { e.preventDefault(); const v = $('webhook').value.trim(); if (!v) return; act('/api/settings', { discord_webhook: v }).then(() => $('webhook').value = ''); };
+$('testDiscord').onclick = () => act('/api/discord/test');
+$('removeWebhook').onclick = () => act('/api/settings', { discord_webhook: '' }, 'Stop posting to Discord?');
+$('copyTunnel').onclick = async () => { try { await navigator.clipboard.writeText(state.public.url); toast('Copied'); } catch (e) { toast('Couldn\'t copy. Select it above.', true); } };
 $('cmdForm').onsubmit = e => { e.preventDefault(); const v = $('cmdInput').value.trim(); if (v) { sendCmd(v); $('cmdInput').value = ''; } };
 document.addEventListener('click', e => {
   const q = e.target.closest('[data-cmd]'); if (q) return sendCmd(q.dataset.cmd);
