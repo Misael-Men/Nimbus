@@ -559,28 +559,16 @@ class Monitor:
                                "webhook_set": bool(load_settings().get("discord_webhook"))}}
 
     def public_status(self):
-        """What the shareable page shows: no paths, IPs, console or controls."""
+        """Everything the dashboard shows, minus controls, console, backups list and file paths."""
         with self.lock:
-            snap = self.snapshot
-            history = {k: list(self.history[k]) for k in ("tps", "mspt", "cpu")}
-        if not snap:
-            return {}
-        srv, mem = snap["server"], snap["memory"]
-        ping, proc = srv["ping"], srv["process"]
-        return {
-            "time": snap["time"],
-            "join_address": load_settings().get("join_address", ""),
-            "state": srv["state"],
-            "version": ping and ping["version"],
-            "motd": ping and ping["motd"],
-            "players": ping and {"online": ping["online"], "max": ping["max"], "names": ping["names"]},
-            "ticks": srv["ticks"],
-            "server_uptime": proc and proc["uptime"],
-            "cpu": snap["cpu"]["total"],
-            "cpu_temp": snap["temps"]["cpu"],
-            "ram_percent": round(100 * mem["used"] / mem["total"], 1) if mem["total"] else None,
-            "history": history,
-        }
+            if not self.snapshot:
+                return {}
+            snap = json.loads(json.dumps(self.snapshot))
+            history = {k: list(v) for k, v in self.history.items()}
+        snap["server"].pop("dir", None)
+        snap["server"]["console"] = False
+        return {**snap, "history": history, "task": None,
+                "join_address": load_settings().get("join_address", "")}
 
     # -------- actions
 
@@ -1140,11 +1128,13 @@ input[type=text], input[type=password] { flex: 1; min-width: 0; font: inherit; p
 #login p { color: var(--muted); }
 details summary { cursor: pointer; color: var(--muted); margin-top: 8px; }
 @media (max-width: 560px) { header, main { padding-left: 16px; padding-right: 16px; } .big { font-size: 26px; } }
+body.public .admin-only, body:not(.public) .public-only { display: none !important; }
+.join { font: 600 22px/1.3 ui-monospace, Consolas, "Cascadia Mono", monospace; word-break: break-all; margin: 2px 0 4px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Nimbus</h1><span class="host" id="host"></span>
+  <h1 id="brand">Nimbus</h1><span class="host admin-only" id="host"></span>
   <span class="spacer"></span>
   <span class="sub" id="updated"></span>
 </header>
@@ -1158,6 +1148,12 @@ details summary { cursor: pointer; color: var(--muted); margin-top: 8px; }
 <main id="app" hidden>
   <div class="alerts" id="alerts"></div>
   <div class="grid">
+    <section class="card wide public-only">
+      <h2>Join</h2>
+      <div class="join" id="joinText">–</div>
+      <div class="btns" style="margin-top:8px"><button class="primary" id="copyJoin">Copy address</button></div>
+    </section>
+
     <section class="card">
       <h2>Minecraft server</h2>
       <div class="split"><span class="pill" id="mcState">…</span><span class="sub" id="mcVersion"></span></div>
@@ -1169,13 +1165,13 @@ details summary { cursor: pointer; color: var(--muted); margin-top: 8px; }
         <div class="row"><span>Server uptime</span><span id="mcUptime">–</span></div>
       </div>
       <canvas class="spark" id="sparkMc"></canvas>
-      <div class="btns">
+      <div class="btns admin-only">
         <button class="primary" id="btnStart">Start</button>
         <button id="btnStop">Stop</button>
         <button id="btnRestart">Restart</button>
         <button class="danger" id="btnKill" title="Only if the server is frozen">Force kill</button>
       </div>
-      <div class="sub" id="task" style="margin-top:10px"></div>
+      <div class="sub admin-only" id="task" style="margin-top:10px"></div>
     </section>
 
     <section class="card">
@@ -1240,10 +1236,10 @@ details summary { cursor: pointer; color: var(--muted); margin-top: 8px; }
     <section class="card">
       <h2>Players online</h2>
       <div class="list" id="players"></div>
-      <form class="cmd" id="playerForm"><input type="text" id="playerName" placeholder="Player name"><button type="button" data-p="whitelist add">Whitelist</button><button type="button" data-p="op">Op</button></form>
+      <form class="cmd admin-only" id="playerForm"><input type="text" id="playerName" placeholder="Player name"><button type="button" data-p="whitelist add">Whitelist</button><button type="button" data-p="op">Op</button></form>
     </section>
 
-    <section class="card wide">
+    <section class="card wide admin-only">
       <h2>Console</h2>
       <div class="console" id="console"></div>
       <form class="cmd" id="cmdForm"><input type="text" id="cmdInput" placeholder="Type a server command, e.g. say hello" autocomplete="off"><button class="primary">Send</button></form>
@@ -1260,9 +1256,9 @@ details summary { cursor: pointer; color: var(--muted); margin-top: 8px; }
       </div>
     </section>
 
-    <section class="card wide">
+    <section class="card wide admin-only">
       <h2>Page for friends</h2>
-      <div class="sub">A read-only page with server status, players and performance. No controls, console, or system details.</div>
+      <div class="sub">A read-only copy of this dashboard, without controls, the console, or backups.</div>
       <form class="cmd" id="publicForm"><input type="text" id="joinAddress" placeholder="Address friends join with, e.g. something.joinmc.link"><button class="primary">Save</button></form>
       <div class="row" style="margin-top:12px"><span>Public link</span><span id="tunnelUrl">–</span></div>
       <div class="row"><span>On your network</span><span id="publicUrl">–</span></div>
@@ -1273,7 +1269,7 @@ details summary { cursor: pointer; color: var(--muted); margin-top: 8px; }
       <div class="sub" id="discordStatus" style="margin-top:8px"></div>
     </section>
 
-    <section class="card wide">
+    <section class="card wide admin-only">
       <h2>Backups</h2>
       <div class="btns" style="margin-top:0;margin-bottom:10px"><button class="primary" id="btnBackup">Back up now</button><span class="sub" style="align-self:center">Saves the world, then archives it to <code>minecraft/backups</code>.</span></div>
       <div class="list" id="backups"></div>
@@ -1284,6 +1280,8 @@ details summary { cursor: pointer; color: var(--muted); margin-top: 8px; }
 
 <script>
 const $ = id => document.getElementById(id);
+const PUBLIC = !!window.NIMBUS_PUBLIC;
+if (PUBLIC) document.body.classList.add('public');
 let token = '';
 try { token = localStorage.getItem('nimbus-token') || ''; } catch (e) {}
 if (location.hash.startsWith('#token=')) {
@@ -1316,6 +1314,10 @@ function setBar(id, pct) {
 }
 
 async function api(path, opts = {}) {
+  if (PUBLIC) {
+    if (path !== '/api/status') throw new Error('read-only');
+    const r = await fetch('/api/public'); return r.json();
+  }
   const res = await fetch(path, { ...opts, headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } });
   if (res.status === 401) { showLogin(); throw new Error('unauthorized'); }
   const data = await res.json();
@@ -1363,6 +1365,12 @@ function render(s) {
     if (document.activeElement !== $('joinAddress') && !render.joinLoaded) { $('joinAddress').value = s.public.join_address || ''; render.joinLoaded = true; }
   }
   $('updated').textContent = 'Updated ' + new Date(s.time * 1000).toLocaleTimeString();
+  if (PUBLIC) {
+    const name = s.server.ping && s.server.ping.motd ? s.server.ping.motd : 'Minecraft server';
+    $('brand').textContent = name; document.title = name;
+    $('joinText').textContent = s.join_address || 'Ask the owner for the address';
+    $('copyJoin').hidden = !s.join_address;
+  }
 
   const srv = s.server, st = srv.state, ping = srv.ping, proc = srv.process;
   const pill = $('mcState'); pill.className = 'pill s-' + st; pill.textContent = st[0].toUpperCase() + st.slice(1);
@@ -1390,7 +1398,7 @@ function render(s) {
   $('mspt').style.color = msNow == null ? '' : msNow < 40 ? css('--good') : msNow < 50 ? css('--warn') : css('--bad');
   $('tpsAvg').textContent = tk && tk.tps ? tk.tps.map(v => v.toFixed(1)).join(' / ') : '–';
   $('msptRange').textContent = tk && tk.mspt ? `${tk.mspt.min.toFixed(1)} / ${tk.mspt.max.toFixed(1)} ms` : '–';
-  $('tickNote').textContent = st === 'running' && !tk ? 'Restart the server once from here to turn on TPS tracking.' : '';
+  $('tickNote').textContent = !PUBLIC && st === 'running' && !tk ? 'Restart the server once from here to turn on TPS tracking.' : '';
   spark('sparkMspt', s.history.mspt, 50, css('--accent'), 50);
   spark('sparkTps', s.history.tps, 20, css('--good'));
 
@@ -1435,10 +1443,10 @@ function render(s) {
   $('ncpu').textContent = cpu.count;
 
   const names = ping ? ping.names : [];
-  $('players').innerHTML = names.length ? names.map(nm => `<div class="item"><span class="name">${esc(nm)}</span>
+  $('players').innerHTML = names.length ? names.map(nm => `<div class="item"><span class="name">${esc(nm)}</span>${PUBLIC ? '' : `
       <button class="small" data-pc="gamemode survival ${esc(nm)}">Survival</button>
       <button class="small" data-pc="gamemode creative ${esc(nm)}">Creative</button>
-      <button class="small danger" data-pc="kick ${esc(nm)}" data-confirm="Kick ${esc(nm)}?">Kick</button></div>`).join('')
+      <button class="small danger" data-pc="kick ${esc(nm)}" data-confirm="Kick ${esc(nm)}?">Kick</button>`}</div>`).join('')
     : `<div class="empty">${st === 'running' ? 'Nobody online' : 'Server offline'}</div>`;
 
   const alerts = [];
@@ -1447,14 +1455,14 @@ function render(s) {
   if (t.cpu >= 90) alerts.push(['bad', `CPU is very hot (${t.cpu}°C). Check the vents and fans.`]);
   else if (t.cpu >= 80) alerts.push(['warn', `CPU is running warm (${t.cpu}°C).`]);
   if (ramPct >= 92) alerts.push(['warn', 'RAM is almost full.']);
-  if (diskPct >= 90) alerts.push(['bad', `Disk is ${diskPct.toFixed(0)}% full. Delete old backups.`]);
+  if (diskPct >= 90) alerts.push(['bad', `Disk is ${diskPct.toFixed(0)}% full.`]);
   if (n.wifi && n.wifi.dbm < -75) alerts.push(['warn', 'Wi-Fi signal is weak, so players may lag.']);
   $('alerts').innerHTML = alerts.map(([k, msg]) => `<div class="alert ${k === 'warn' ? 'warn' : ''}">${esc(msg)}</div>`).join('');
 
   spark('sparkCpu', s.history.cpu, 100, css('--accent'));
   spark('sparkMc', s.history.mc_cpu, 25, css('--good'));
 
-  if (Date.now() - lastBackupFetch > 15000 || (renderBackups.wasBusy && !busy)) { lastBackupFetch = Date.now(); loadBackups(); }
+  if (!PUBLIC && Date.now() - lastBackupFetch > 15000 || (renderBackups.wasBusy && !busy)) { lastBackupFetch = Date.now(); loadBackups(); }
   renderBackups.wasBusy = busy;
 }
 
@@ -1492,6 +1500,7 @@ let timers = [];
 function startApp() {
   $('login').hidden = true; $('app').hidden = false;
   timers.forEach(clearInterval);
+  if (PUBLIC) { pollStatus(); timers = [setInterval(pollStatus, 2500)]; return; }
   pollStatus(); pollConsole(); loadBackups();
   timers = [setInterval(pollStatus, 2000), setInterval(pollConsole, 1000)];
 }
@@ -1521,137 +1530,20 @@ document.addEventListener('click', e => {
 });
 window.addEventListener('resize', () => state && render(state));
 
-if (token) api('/api/status').then(startApp).catch(e => { if (e.message !== 'unauthorized') startApp(); }); else showLogin();
+$('copyJoin').onclick = async () => {
+  try { await navigator.clipboard.writeText(state.join_address); toast('Copied'); } catch (e) { toast('Couldn\'t copy. Select it above.', true); }
+};
+if (PUBLIC) startApp();
+else if (token) api('/api/status').then(startApp).catch(e => { if (e.message !== 'unauthorized') startApp(); }); else showLogin();
 </script>
 </body>
 </html>
 """
 
-PUBLIC_PAGE = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Server Status</title>
-STYLE
-<style>
-main { max-width: 980px; }
-.join { font: 600 22px/1.3 ui-monospace, Consolas, "Cascadia Mono", monospace; word-break: break-all; margin: 6px 0 4px; }
-.names { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
-.names span { padding: 3px 10px; border-radius: 999px; background: var(--track); font-size: 13px; }
-footer { text-align: center; color: var(--muted); font-size: 12px; padding: 0 20px 30px; }
-</style>
-</head>
-<body>
-<header>
-  <h1 id="title">Minecraft server</h1>
-  <span class="spacer"></span>
-  <span class="pill" id="state">…</span>
-</header>
-<main>
-  <div class="grid">
-    <section class="card wide">
-      <h2>Join</h2>
-      <div class="join" id="join">–</div>
-      <div class="btns" style="margin-top:8px"><button class="primary" id="copy">Copy address</button><span class="sub" id="version" style="align-self:center"></span></div>
-    </section>
+PUBLIC_PAGE = (PAGE.replace("<title>Nimbus</title>", "<title>Server Status</title>", 1)
+               .replace("<script>\nconst $", "<script>window.NIMBUS_PUBLIC = true;</script>\n<script>\nconst $", 1))
+assert "window.NIMBUS_PUBLIC = true" in PUBLIC_PAGE
 
-    <section class="card">
-      <h2>Players</h2>
-      <div class="big" id="players">–</div>
-      <div class="names" id="names"></div>
-    </section>
-
-    <section class="card">
-      <h2>Performance</h2>
-      <div class="split">
-        <div><div class="big" id="tps">–</div><div class="sub">TPS (20 is perfect)</div></div>
-        <div><div class="big" id="mspt">–</div><div class="sub">ms per tick</div></div>
-      </div>
-      <div class="sub" style="margin-top:12px">Tick time, last 5 minutes</div>
-      <canvas class="spark" id="sparkMspt"></canvas>
-    </section>
-
-    <section class="card">
-      <h2>Host</h2>
-      <div class="row"><span>CPU</span><span id="cpu">–</span></div>
-      <div class="row"><span>CPU temperature</span><span id="temp">–</span></div>
-      <div class="row"><span>Memory</span><span id="ram">–</span></div>
-      <div class="row"><span>Server up for</span><span id="uptime">–</span></div>
-      <canvas class="spark" id="sparkCpu"></canvas>
-    </section>
-  </div>
-</main>
-<footer id="updated"></footer>
-<script>
-const $ = id => document.getElementById(id);
-function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
-function esc(t) { return String(t).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function fmtDur(s) {
-  if (s == null) return '–';
-  s = Math.floor(s); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
-  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
-}
-function spark(id, data, max, color, limit) {
-  const c = $(id), dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
-  if (!w) return;
-  c.width = w * dpr; c.height = h * dpr;
-  const g = c.getContext('2d'); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
-  const pts = data.filter(v => v != null);
-  if (pts.length < 2) return;
-  const top = Math.max(max, ...pts), n = 150, step = w / (n - 1), off = n - data.length;
-  g.beginPath();
-  data.forEach((v, i) => { const x = (i + off) * step, y = h - 2 - ((v || 0) / top) * (h - 4); i ? g.lineTo(x, y) : g.moveTo(x, y); });
-  g.strokeStyle = color; g.lineWidth = 1.5; g.stroke();
-  g.lineTo((data.length - 1 + off) * step, h); g.lineTo(off * step, h); g.closePath();
-  g.globalAlpha = .12; g.fillStyle = color; g.fill(); g.globalAlpha = 1;
-  if (limit != null) {
-    const y = h - 2 - (limit / top) * (h - 4);
-    g.setLineDash([4, 4]); g.strokeStyle = css('--bad'); g.lineWidth = 1;
-    g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke(); g.setLineDash([]);
-  }
-}
-let last = null;
-function render(s) {
-  last = s;
-  const labels = { running: 'Online', starting: 'Starting', stopping: 'Stopping', stopped: 'Offline' };
-  $('state').className = 'pill s-' + s.state; $('state').textContent = labels[s.state] || s.state;
-  $('title').textContent = s.motd || 'Minecraft server';
-  document.title = (s.motd || 'Minecraft server') + ' · ' + (labels[s.state] || '');
-  $('join').textContent = s.join_address || 'Ask the owner for the address';
-  $('copy').hidden = !s.join_address;
-  $('version').textContent = s.version ? 'Version ' + s.version : '';
-  const p = s.players;
-  $('players').textContent = p ? `${p.online} / ${p.max} online` : 'Offline';
-  $('names').innerHTML = p && p.names.length ? p.names.map(n => `<span>${esc(n)}</span>`).join('') : `<span class="sub" style="background:none;padding:0">${p ? 'Nobody online right now' : ''}</span>`;
-  const tk = s.ticks, tps = tk && tk.tps ? tk.tps[0] : null, ms = tk && tk.mspt ? tk.mspt.avg : null;
-  $('tps').textContent = tps != null ? tps.toFixed(1) : '–';
-  $('tps').style.color = tps == null ? '' : tps >= 19.5 ? css('--good') : tps >= 17 ? css('--warn') : css('--bad');
-  $('mspt').textContent = ms != null ? ms.toFixed(1) : '–';
-  $('mspt').style.color = ms == null ? '' : ms < 40 ? css('--good') : ms < 50 ? css('--warn') : css('--bad');
-  $('cpu').textContent = s.cpu != null ? s.cpu.toFixed(0) + '%' : '–';
-  $('temp').textContent = s.cpu_temp != null ? s.cpu_temp.toFixed(0) + '°C' : '–';
-  $('ram').textContent = s.ram_percent != null ? s.ram_percent.toFixed(0) + '%' : '–';
-  $('uptime').textContent = s.state === 'stopped' ? '–' : fmtDur(s.server_uptime);
-  spark('sparkMspt', s.history.mspt, 50, css('--accent'), 50);
-  spark('sparkCpu', s.history.cpu, 100, css('--good'));
-  $('updated').textContent = 'Live · updated ' + new Date(s.time * 1000).toLocaleTimeString();
-}
-async function poll() {
-  try { const r = await fetch('/api/public'); const s = await r.json(); if (s.time) render(s); }
-  catch (e) { $('updated').textContent = 'Can\'t reach the server right now.'; }
-}
-$('copy').onclick = async () => {
-  try { await navigator.clipboard.writeText(last.join_address); $('copy').textContent = 'Copied'; }
-  catch (e) { $('copy').textContent = 'Select and copy above'; }
-  setTimeout(() => $('copy').textContent = 'Copy address', 1500);
-};
-window.addEventListener('resize', () => last && render(last));
-poll(); setInterval(poll, 3000);
-</script>
-</body>
-</html>
-""".replace("STYLE", PAGE[PAGE.index("<style>"):PAGE.index("</style>") + len("</style>")], 1)
 
 if __name__ == "__main__":
     main()
