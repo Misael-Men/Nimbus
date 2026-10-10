@@ -679,6 +679,15 @@ def read_console(offset):
 MONITOR = Monitor()
 
 
+class DualStackServer(ThreadingHTTPServer):
+    """Listens on IPv6 and IPv4, since nuke.local can resolve to either."""
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "Nimbus"
 
@@ -845,7 +854,10 @@ def main():
     except OSError as exc:
         print(f"Couldn't enable RCON in server.properties: {exc}", flush=True)
     threading.Thread(target=MONITOR.run, daemon=True).start()
-    server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
+    try:
+        server = DualStackServer(("::", args.port), Handler)
+    except OSError:
+        server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
     print(f"Nimbus on http://{lan_ip()}:{args.port}  (token: {TOKEN})", flush=True)
     server.serve_forever()
     return None
