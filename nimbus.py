@@ -721,12 +721,13 @@ def read_console(offset):
 
 # ---------------------------------------------------------------- http
 
-def post_to_discord(webhook, text):
-    data = json.dumps({"content": text, "allowed_mentions": {"parse": []}}).encode()
-    req = urllib.request.Request(webhook, data=data, method="POST", headers={
+def discord_request(url, method, payload=None):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
         "Content-Type": "application/json", "User-Agent": "Nimbus (minecraft dashboard, 1.0)"})
     with urllib.request.urlopen(req, timeout=10) as resp:
-        return resp.status
+        body = resp.read()
+    return json.loads(body) if body else None
 
 
 class Tunnel:
@@ -737,7 +738,8 @@ class Tunnel:
         self.status = "off"
         self.discord = ""
 
-    def announce(self, test=False):
+    def announce(self):
+        """Delete the link Nimbus posted last time, then post the current one."""
         settings = load_settings()
         webhook = settings.get("discord_webhook")
         if not webhook:
@@ -747,9 +749,25 @@ class Tunnel:
         lines = [f"**Server status page:** {self.url}"]
         if settings.get("join_address"):
             lines.append(f"**Join address:** `{settings['join_address']}`")
-        if test:
-            lines.append("_(test message from Nimbus)_")
-        post_to_discord(webhook, "\n".join(lines))
+
+        note = ""
+        previous = settings.get("last_message_id")
+        if previous:
+            try:
+                discord_request(f"{webhook}/messages/{previous}", "DELETE")
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:  # 404: already deleted by hand
+                    note = f" (couldn't delete the old one: HTTP {exc.code})"
+            except (OSError, urllib.error.URLError) as exc:
+                note = f" (couldn't delete the old one: {exc})"
+
+        message = discord_request(webhook + "?wait=true", "POST",
+                                  {"content": "\n".join(lines), "allowed_mentions": {"parse": []}})
+        settings = load_settings()
+        settings["last_message_id"] = (message or {}).get("id")
+        settings["last_announced_url"] = self.url
+        save_settings(settings)
+        self.discord = "Posted the current link to Discord" + note + "."
 
     def _announce_new(self):
         settings = load_settings()
@@ -757,11 +775,7 @@ class Tunnel:
             return
         try:
             self.announce()
-            settings = load_settings()
-            settings["last_announced_url"] = self.url
-            save_settings(settings)
-            self.discord = "Posted the new link to Discord."
-        except (OSError, urllib.error.URLError, RuntimeError) as exc:
+        except (OSError, urllib.error.URLError, RuntimeError, ValueError) as exc:
             self.discord = f"Couldn't post to Discord: {exc}"
 
     def run(self, port):
@@ -890,6 +904,8 @@ class Handler(BaseHTTPRequestHandler):
                     webhook = str(body["discord_webhook"]).strip()
                     if webhook and not WEBHOOK_RE.match(webhook):
                         raise RuntimeError("That doesn't look like a Discord webhook URL.")
+                    if webhook != settings.get("discord_webhook"):
+                        settings.pop("last_message_id", None)
                     settings["discord_webhook"] = webhook
                     settings.pop("last_announced_url", None)
                 save_settings(settings)
@@ -898,10 +914,10 @@ class Handler(BaseHTTPRequestHandler):
                 msg = "Saved."
             elif url.path == "/api/discord/test":
                 try:
-                    TUNNEL.announce(test=True)
+                    TUNNEL.announce()
                 except urllib.error.URLError as exc:
                     raise RuntimeError(f"Discord didn't accept it: {exc}") from exc
-                msg = "Sent to Discord."
+                msg = "Posted to Discord."
             elif url.path == "/api/backup":
                 MONITOR.backup()
                 msg = "Backup started…"
@@ -1252,8 +1268,8 @@ details summary { cursor: pointer; color: var(--muted); margin-top: 8px; }
       <div class="row"><span>On your network</span><span id="publicUrl">–</span></div>
       <div class="btns"><button type="button" id="copyTunnel">Copy public link</button><a id="publicLink" target="_blank" rel="noopener"><button type="button">Open page</button></a></div>
       <h2 style="margin-top:18px">Discord</h2>
-      <div class="sub">Posts the public link to a channel whenever it changes. In Discord: channel settings → Integrations → Webhooks → New Webhook → Copy Webhook URL.</div>
-      <form class="cmd" id="webhookForm"><input type="password" id="webhook" placeholder="Paste webhook URL" autocomplete="off"><button class="primary">Save</button><button type="button" id="testDiscord">Send test</button><button type="button" class="danger" id="removeWebhook">Remove</button></form>
+      <div class="sub">Posts the public link to a channel whenever it changes, deleting the previous post. In Discord: channel settings → Integrations → Webhooks → New Webhook → Copy Webhook URL.</div>
+      <form class="cmd" id="webhookForm"><input type="password" id="webhook" placeholder="Paste webhook URL" autocomplete="off"><button class="primary">Save</button><button type="button" id="testDiscord">Post now</button><button type="button" class="danger" id="removeWebhook">Remove</button></form>
       <div class="sub" id="discordStatus" style="margin-top:8px"></div>
     </section>
 
