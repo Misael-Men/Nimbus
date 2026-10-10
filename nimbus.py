@@ -36,6 +36,8 @@ BACKUP_NAME_RE = re.compile(r"^world-\d{8}-\d{6}\.tar\.gz$")
 
 MC_DIR = Path.home() / "minecraft"
 TOKEN = ""
+PUBLIC_PORT = 8766
+SETTINGS_PATH = Path.home() / ".config" / "nimbus" / "settings.json"
 
 
 # ---------------------------------------------------------------- helpers
@@ -75,6 +77,18 @@ def dir_size(path):
             except OSError:
                 pass
     return total
+
+
+def load_settings():
+    try:
+        return json.loads(SETTINGS_PATH.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings):
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_PATH.write_text(json.dumps(settings, indent=2) + "\n")
 
 
 def load_token():
@@ -535,7 +549,32 @@ class Monitor:
     def status(self):
         with self.lock:
             return {**self.snapshot, "history": {k: list(v) for k, v in self.history.items()},
-                    "task": dict(self.task)}
+                    "task": dict(self.task),
+                    "public": {"port": PUBLIC_PORT, "join_address": load_settings().get("join_address", "")}}
+
+    def public_status(self):
+        """What the shareable page shows: no paths, IPs, console or controls."""
+        with self.lock:
+            snap = self.snapshot
+            history = {k: list(self.history[k]) for k in ("tps", "mspt", "cpu")}
+        if not snap:
+            return {}
+        srv, mem = snap["server"], snap["memory"]
+        ping, proc = srv["ping"], srv["process"]
+        return {
+            "time": snap["time"],
+            "join_address": load_settings().get("join_address", ""),
+            "state": srv["state"],
+            "version": ping and ping["version"],
+            "motd": ping and ping["motd"],
+            "players": ping and {"online": ping["online"], "max": ping["max"], "names": ping["names"]},
+            "ticks": srv["ticks"],
+            "server_uptime": proc and proc["uptime"],
+            "cpu": snap["cpu"]["total"],
+            "cpu_temp": snap["temps"]["cpu"],
+            "ram_percent": round(100 * mem["used"] / mem["total"], 1) if mem["total"] else None,
+            "history": history,
+        }
 
     # -------- actions
 
@@ -770,6 +809,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise RuntimeError("Enter a single command.")
                 send_console(command)
                 msg = f"Sent: {command}"
+            elif url.path == "/api/settings":
+                settings = load_settings()
+                address = str(body.get("join_address", "")).strip()[:200]
+                settings["join_address"] = address
+                save_settings(settings)
+                msg = "Saved."
             elif url.path == "/api/backup":
                 MONITOR.backup()
                 msg = "Backup started…"
@@ -785,6 +830,40 @@ class Handler(BaseHTTPRequestHandler):
         except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
             return self._send(400, {"error": str(exc)})
         return self._send(200, {"message": msg})
+
+
+class PublicHandler(BaseHTTPRequestHandler):
+    """Read-only status page for sharing. Serves nothing but the page and its data."""
+    server_version = "Nimbus"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _send(self, code, data, ctype):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path in ("/", "/index.html"):
+            return self._send(200, PUBLIC_PAGE.encode(), "text/html; charset=utf-8")
+        if path == "/api/public":
+            return self._send(200, json.dumps(MONITOR.public_status()).encode(), "application/json")
+        return self._send(404, b"Not found", "text/plain")
+
+
+def serve(port, handler):
+    try:
+        server = DualStackServer(("::", port), handler)
+    except OSError:
+        server = ThreadingHTTPServer(("0.0.0.0", port), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
 
 
 # ---------------------------------------------------------------- install
@@ -822,16 +901,18 @@ WantedBy=multi-user.target
     ufw = subprocess.run(["ufw", "status"], capture_output=True, text=True) if shutil.which("ufw") else None
     if ufw and "Status: active" in ufw.stdout:
         subprocess.run(["ufw", "allow", f"{port}/tcp"], check=True)
+        subprocess.run(["ufw", "allow", f"{PUBLIC_PORT}/tcp"], check=True)
     print(f"\nNimbus is running and will start on boot.\n"
           f"  Open:  http://{lan_ip()}:{port}\n"
           f"  Token: {token}\n")
 
 
 def main():
-    global MC_DIR, TOKEN
+    global MC_DIR, TOKEN, PUBLIC_PORT, SETTINGS_PATH
     parser = argparse.ArgumentParser(description="Minecraft server dashboard")
     parser.add_argument("--mc-dir", default=str(Path.home() / "minecraft"))
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--public-port", type=int, default=8766, help="read-only page for friends (0 = off)")
     parser.add_argument("--install", action="store_true", help="install as a systemd service (use sudo)")
     parser.add_argument("--token", action="store_true", help="print the access token and exit")
     args = parser.parse_args()
@@ -844,6 +925,8 @@ def main():
         return install(args.port)
 
     MC_DIR = Path(args.mc_dir).expanduser().resolve()
+    PUBLIC_PORT = args.public_port
+    SETTINGS_PATH = Path.home() / ".config" / "nimbus" / "settings.json"
     TOKEN = load_token()
     if args.token:
         print(TOKEN)
@@ -854,12 +937,15 @@ def main():
     except OSError as exc:
         print(f"Couldn't enable RCON in server.properties: {exc}", flush=True)
     threading.Thread(target=MONITOR.run, daemon=True).start()
-    try:
-        server = DualStackServer(("::", args.port), Handler)
-    except OSError:
-        server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
+    if PUBLIC_PORT:
+        try:
+            serve(PUBLIC_PORT, PublicHandler)
+            print(f"Public page on http://{lan_ip()}:{PUBLIC_PORT}", flush=True)
+        except OSError as exc:
+            print(f"Couldn't open the public page on port {PUBLIC_PORT}: {exc}", flush=True)
+    server = serve(args.port, Handler)
     print(f"Nimbus on http://{lan_ip()}:{args.port}  (token: {TOKEN})", flush=True)
-    server.serve_forever()
+    threading.Event().wait()
     return None
 
 
@@ -897,7 +983,7 @@ main { padding: 16px 20px 40px; max-width: 1400px; margin: 0 auto; }
 .alert { padding: 10px 14px; border-radius: 8px; border: 1px solid var(--bad);
   color: var(--bad); background: color-mix(in srgb, var(--bad) 10%, transparent); font-weight: 500; }
 .alert.warn { border-color: var(--warn); color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); }
-.grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; min-width: 0; }
 .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted);
   margin: 0 0 12px; font-weight: 600; }
@@ -1069,6 +1155,13 @@ details summary { cursor: pointer; color: var(--muted); margin-top: 8px; }
     </section>
 
     <section class="card wide">
+      <h2>Page for friends</h2>
+      <div class="sub">A read-only page with server status, players and performance. No controls, console, or system details.</div>
+      <form class="cmd" id="publicForm"><input type="text" id="joinAddress" placeholder="Address friends join with, e.g. something.joinmc.link"><button class="primary">Save</button></form>
+      <div class="btns"><a id="publicLink" target="_blank" rel="noopener"><button type="button">Open page</button></a><span class="sub" id="publicUrl" style="align-self:center"></span></div>
+    </section>
+
+    <section class="card wide">
       <h2>Backups</h2>
       <div class="btns" style="margin-top:0;margin-bottom:10px"><button class="primary" id="btnBackup">Back up now</button><span class="sub" style="align-self:center">Saves the world, then archives it to <code>minecraft/backups</code>.</span></div>
       <div class="list" id="backups"></div>
@@ -1148,6 +1241,11 @@ function spark(id, data, max, color, limit) {
 function render(s) {
   state = s;
   $('host').textContent = s.hostname || '';
+  if (s.public) {
+    const url = s.public.port ? `${location.protocol}//${location.hostname}:${s.public.port}/` : '';
+    $('publicLink').href = url; $('publicUrl').textContent = url ? `On your network: ${url}` : 'Turned off';
+    if (document.activeElement !== $('joinAddress') && !render.joinLoaded) { $('joinAddress').value = s.public.join_address || ''; render.joinLoaded = true; }
+  }
   $('updated').textContent = 'Updated ' + new Date(s.time * 1000).toLocaleTimeString();
 
   const srv = s.server, st = srv.state, ping = srv.ping, proc = srv.process;
@@ -1292,6 +1390,7 @@ $('btnStop').onclick = () => act('/api/server/stop', null, 'Stop the server? Pla
 $('btnRestart').onclick = () => act('/api/server/restart', null, 'Restart the server? Players will be disconnected.');
 $('btnKill').onclick = () => act('/api/server/kill', null, 'Force kill the server process? Anything not saved will be lost. Only use this if the server is frozen.');
 $('btnBackup').onclick = () => act('/api/backup');
+$('publicForm').onsubmit = e => { e.preventDefault(); act('/api/settings', { join_address: $('joinAddress').value }); };
 $('cmdForm').onsubmit = e => { e.preventDefault(); const v = $('cmdInput').value.trim(); if (v) { sendCmd(v); $('cmdInput').value = ''; } };
 document.addEventListener('click', e => {
   const q = e.target.closest('[data-cmd]'); if (q) return sendCmd(q.dataset.cmd);
@@ -1307,6 +1406,132 @@ if (token) api('/api/status').then(startApp).catch(e => { if (e.message !== 'una
 </body>
 </html>
 """
+
+PUBLIC_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server Status</title>
+STYLE
+<style>
+main { max-width: 980px; }
+.join { font: 600 22px/1.3 ui-monospace, Consolas, "Cascadia Mono", monospace; word-break: break-all; margin: 6px 0 4px; }
+.names { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.names span { padding: 3px 10px; border-radius: 999px; background: var(--track); font-size: 13px; }
+footer { text-align: center; color: var(--muted); font-size: 12px; padding: 0 20px 30px; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Minecraft server</h1>
+  <span class="spacer"></span>
+  <span class="pill" id="state">…</span>
+</header>
+<main>
+  <div class="grid">
+    <section class="card wide">
+      <h2>Join</h2>
+      <div class="join" id="join">–</div>
+      <div class="btns" style="margin-top:8px"><button class="primary" id="copy">Copy address</button><span class="sub" id="version" style="align-self:center"></span></div>
+    </section>
+
+    <section class="card">
+      <h2>Players</h2>
+      <div class="big" id="players">–</div>
+      <div class="names" id="names"></div>
+    </section>
+
+    <section class="card">
+      <h2>Performance</h2>
+      <div class="split">
+        <div><div class="big" id="tps">–</div><div class="sub">TPS (20 is perfect)</div></div>
+        <div><div class="big" id="mspt">–</div><div class="sub">ms per tick</div></div>
+      </div>
+      <div class="sub" style="margin-top:12px">Tick time, last 5 minutes</div>
+      <canvas class="spark" id="sparkMspt"></canvas>
+    </section>
+
+    <section class="card">
+      <h2>Host</h2>
+      <div class="row"><span>CPU</span><span id="cpu">–</span></div>
+      <div class="row"><span>CPU temperature</span><span id="temp">–</span></div>
+      <div class="row"><span>Memory</span><span id="ram">–</span></div>
+      <div class="row"><span>Server up for</span><span id="uptime">–</span></div>
+      <canvas class="spark" id="sparkCpu"></canvas>
+    </section>
+  </div>
+</main>
+<footer id="updated"></footer>
+<script>
+const $ = id => document.getElementById(id);
+function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+function esc(t) { return String(t).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function fmtDur(s) {
+  if (s == null) return '–';
+  s = Math.floor(s); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+}
+function spark(id, data, max, color, limit) {
+  const c = $(id), dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
+  if (!w) return;
+  c.width = w * dpr; c.height = h * dpr;
+  const g = c.getContext('2d'); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
+  const pts = data.filter(v => v != null);
+  if (pts.length < 2) return;
+  const top = Math.max(max, ...pts), n = 150, step = w / (n - 1), off = n - data.length;
+  g.beginPath();
+  data.forEach((v, i) => { const x = (i + off) * step, y = h - 2 - ((v || 0) / top) * (h - 4); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+  g.strokeStyle = color; g.lineWidth = 1.5; g.stroke();
+  g.lineTo((data.length - 1 + off) * step, h); g.lineTo(off * step, h); g.closePath();
+  g.globalAlpha = .12; g.fillStyle = color; g.fill(); g.globalAlpha = 1;
+  if (limit != null) {
+    const y = h - 2 - (limit / top) * (h - 4);
+    g.setLineDash([4, 4]); g.strokeStyle = css('--bad'); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke(); g.setLineDash([]);
+  }
+}
+let last = null;
+function render(s) {
+  last = s;
+  const labels = { running: 'Online', starting: 'Starting', stopping: 'Stopping', stopped: 'Offline' };
+  $('state').className = 'pill s-' + s.state; $('state').textContent = labels[s.state] || s.state;
+  $('title').textContent = s.motd || 'Minecraft server';
+  document.title = (s.motd || 'Minecraft server') + ' · ' + (labels[s.state] || '');
+  $('join').textContent = s.join_address || 'Ask the owner for the address';
+  $('copy').hidden = !s.join_address;
+  $('version').textContent = s.version ? 'Version ' + s.version : '';
+  const p = s.players;
+  $('players').textContent = p ? `${p.online} / ${p.max} online` : 'Offline';
+  $('names').innerHTML = p && p.names.length ? p.names.map(n => `<span>${esc(n)}</span>`).join('') : `<span class="sub" style="background:none;padding:0">${p ? 'Nobody online right now' : ''}</span>`;
+  const tk = s.ticks, tps = tk && tk.tps ? tk.tps[0] : null, ms = tk && tk.mspt ? tk.mspt.avg : null;
+  $('tps').textContent = tps != null ? tps.toFixed(1) : '–';
+  $('tps').style.color = tps == null ? '' : tps >= 19.5 ? css('--good') : tps >= 17 ? css('--warn') : css('--bad');
+  $('mspt').textContent = ms != null ? ms.toFixed(1) : '–';
+  $('mspt').style.color = ms == null ? '' : ms < 40 ? css('--good') : ms < 50 ? css('--warn') : css('--bad');
+  $('cpu').textContent = s.cpu != null ? s.cpu.toFixed(0) + '%' : '–';
+  $('temp').textContent = s.cpu_temp != null ? s.cpu_temp.toFixed(0) + '°C' : '–';
+  $('ram').textContent = s.ram_percent != null ? s.ram_percent.toFixed(0) + '%' : '–';
+  $('uptime').textContent = s.state === 'stopped' ? '–' : fmtDur(s.server_uptime);
+  spark('sparkMspt', s.history.mspt, 50, css('--accent'), 50);
+  spark('sparkCpu', s.history.cpu, 100, css('--good'));
+  $('updated').textContent = 'Live · updated ' + new Date(s.time * 1000).toLocaleTimeString();
+}
+async function poll() {
+  try { const r = await fetch('/api/public'); const s = await r.json(); if (s.time) render(s); }
+  catch (e) { $('updated').textContent = 'Can\'t reach the server right now.'; }
+}
+$('copy').onclick = async () => {
+  try { await navigator.clipboard.writeText(last.join_address); $('copy').textContent = 'Copied'; }
+  catch (e) { $('copy').textContent = 'Select and copy above'; }
+  setTimeout(() => $('copy').textContent = 'Copy address', 1500);
+};
+window.addEventListener('resize', () => last && render(last));
+poll(); setInterval(poll, 3000);
+</script>
+</body>
+</html>
+""".replace("STYLE", PAGE[PAGE.index("<style>"):PAGE.index("</style>") + len("</style>")], 1)
 
 if __name__ == "__main__":
     main()
