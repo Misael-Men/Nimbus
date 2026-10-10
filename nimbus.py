@@ -323,13 +323,102 @@ def ping_server(port, host="127.0.0.1"):
     }
 
 
+# ---------------------------------------------------------------- rcon (tick times)
+
+def ensure_rcon():
+    """Turn on RCON in server.properties so Nimbus can read TPS and MSPT.
+
+    Takes effect the next time the server starts. Returns the (port, password) in use."""
+    path = MC_DIR / "server.properties"
+    if not path.exists():
+        return None
+    props = server_properties()
+    wanted = {"enable-rcon": "true", "broadcast-rcon-to-ops": "false"}
+    if not props.get("rcon.password"):
+        wanted["rcon.password"] = secrets.token_urlsafe(18)
+    if not props.get("rcon.port"):
+        wanted["rcon.port"] = "25575"
+    if any(props.get(k) != v for k, v in wanted.items()):
+        lines, seen = [], set()
+        for line in path.read_text().splitlines():
+            key = line.partition("=")[0].strip()
+            if key in wanted and not line.lstrip().startswith("#"):
+                line = f"{key}={wanted[key]}"
+                seen.add(key)
+            lines.append(line)
+        lines += [f"{k}={v}" for k, v in wanted.items() if k not in seen]
+        path.write_text("\n".join(lines) + "\n")
+        props = server_properties()
+    return int(props.get("rcon.port") or 25575), props.get("rcon.password", "")
+
+
+class Rcon:
+    def __init__(self):
+        self.sock = None
+        self.req = 0
+        self.lock = threading.Lock()
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+
+    def _recv(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise OSError("RCON connection closed")
+            buf += chunk
+        return buf
+
+    def _send(self, kind, payload):
+        self.req += 1
+        data = struct.pack("<ii", self.req, kind) + payload.encode() + b"\0\0"
+        self.sock.sendall(struct.pack("<i", len(data)) + data)
+        length = struct.unpack("<i", self._recv(4))[0]
+        data = self._recv(length)
+        rid = struct.unpack("<i", data[:4])[0]
+        return rid, data[8:-2].decode("utf-8", "replace")
+
+    def command(self, cmd, port, password):
+        with self.lock:
+            try:
+                if self.sock is None:
+                    self.sock = socket.create_connection(("127.0.0.1", port), timeout=3)
+                    if self._send(3, password)[0] == -1:
+                        raise PermissionError("RCON password rejected")
+                return self._send(2, cmd)[1]
+            except Exception:
+                self.close()
+                raise
+
+
+def _numbers(text):
+    return [float(x) for x in re.findall(r"\d+(?:\.\d+)?", re.sub(r"§.", "", text))]
+
+
+def read_tick_stats(rcon, port, password):
+    tps = _numbers(rcon.command("tps", port, password))
+    mspt = _numbers(rcon.command("mspt", port, password))
+    return {
+        "tps": [min(v, 20.0) for v in tps[-3:]] if len(tps) >= 3 else None,         # 1m, 5m, 15m
+        "mspt": {"avg": mspt[-9], "min": mspt[-8], "max": mspt[-7]} if len(mspt) >= 9 else None,  # last 5s
+    }
+
+
 # ---------------------------------------------------------------- sampler
 
 class Monitor:
     def __init__(self):
         self.lock = threading.Lock()
         self.snapshot = {}
-        self.history = {"cpu": [], "temp": [], "ram": [], "mc_cpu": []}
+        self.history = {"cpu": [], "temp": [], "ram": [], "mc_cpu": [], "tps": [], "mspt": []}
+        self.rcon = Rcon()
+        self.ticks = None
         self.slow = {"world_bytes": None, "backup_bytes": None}
         self.ping = None
         self.stopping_since = None
@@ -383,6 +472,19 @@ class Monitor:
                 except (OSError, ValueError):
                     self.ping = None
 
+            if self.ping and not self.stopping_since:
+                props = server_properties()
+                try:
+                    if props.get("enable-rcon") != "true":
+                        raise OSError("RCON is off")
+                    self.ticks = read_tick_stats(self.rcon, int(props.get("rcon.port") or 25575),
+                                                 props.get("rcon.password", ""))
+                except (OSError, ValueError, struct.error):
+                    self.ticks = None
+            else:
+                self.rcon.close()
+                self.ticks = None
+
             if now - last_slow >= 60:
                 last_slow = now
                 self.slow = {
@@ -414,14 +516,16 @@ class Monitor:
                 "power": read_power(),
                 "disk": {"total": disk.total, "used": disk.used, "free": disk.free, **self.slow},
                 "net": net,
-                "server": {"state": state, "process": proc, "ping": self.ping,
+                "server": {"state": state, "process": proc, "ping": self.ping, "ticks": self.ticks,
                            "console": screen_session_exists() if pid else False,
                            "dir": str(MC_DIR)},
             }
             with self.lock:
                 for key, value in (("cpu", usage.get("cpu", 0.0)), ("temp", temps["cpu"]),
                                    ("ram", round(100 * mem["used"] / mem["total"], 1) if mem["total"] else 0),
-                                   ("mc_cpu", proc["cpu"] if proc and proc["cpu"] is not None else 0)):
+                                   ("mc_cpu", proc["cpu"] if proc and proc["cpu"] is not None else 0),
+                                   ("tps", self.ticks["tps"][0] if self.ticks and self.ticks["tps"] else None),
+                                   ("mspt", self.ticks["mspt"]["avg"] if self.ticks and self.ticks["mspt"] else None)):
                     series = self.history[key]
                     series.append(value)
                     del series[:-HISTORY_LEN]
@@ -449,6 +553,7 @@ class Monitor:
         script = MC_DIR / "start.sh"
         if not script.exists():
             raise RuntimeError(f"{script} not found.")
+        ensure_rcon()
         if screen_session_exists():
             raise RuntimeError("A screen session named 'mc' already exists. Close it first (screen -r mc, then exit).")
         subprocess.run(["screen", "-dmS", SCREEN_NAME, str(script)], cwd=MC_DIR, check=True, timeout=10)
@@ -735,6 +840,10 @@ def main():
         print(TOKEN)
         return None
 
+    try:
+        ensure_rcon()
+    except OSError as exc:
+        print(f"Couldn't enable RCON in server.properties: {exc}", flush=True)
     threading.Thread(target=MONITOR.run, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
     print(f"Nimbus on http://{lan_ip()}:{args.port}  (token: {TOKEN})", flush=True)
@@ -866,6 +975,21 @@ details summary { cursor: pointer; color: var(--muted); margin-top: 8px; }
     </section>
 
     <section class="card">
+      <h2>Server performance</h2>
+      <div class="split">
+        <div><div class="big" id="tps">–</div><div class="sub">TPS (20 is perfect)</div></div>
+        <div><div class="big" id="mspt">–</div><div class="sub">ms per tick (under 50 is good)</div></div>
+      </div>
+      <div class="sub" style="margin-top:12px">Tick time, last 5 minutes</div>
+      <canvas class="spark" id="sparkMspt"></canvas>
+      <div class="sub" style="margin-top:8px">TPS, last 5 minutes</div>
+      <canvas class="spark" id="sparkTps"></canvas>
+      <div class="row" style="margin-top:8px"><span>TPS 1m / 5m / 15m</span><span id="tpsAvg">–</span></div>
+      <div class="row"><span>Tick time min / max (5s)</span><span id="msptRange">–</span></div>
+      <div class="sub" id="tickNote" style="margin-top:6px"></div>
+    </section>
+
+    <section class="card">
       <h2>Processor</h2>
       <div class="split">
         <div><div class="big" id="cpuPct">–</div><div class="sub">usage</div></div>
@@ -988,19 +1112,25 @@ async function act(path, body, confirmMsg) {
 }
 function sendCmd(cmd) { return act('/api/command', { command: cmd }); }
 
-function spark(id, data, max, color) {
+function spark(id, data, max, color, limit) {
   const c = $(id), dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
   if (!w) return;
   c.width = w * dpr; c.height = h * dpr;
   const g = c.getContext('2d'); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
   const pts = data.filter(v => v != null);
   if (pts.length < 2) return;
+  data = data.map(v => v == null ? null : v);
   const top = Math.max(max, ...pts), n = 150, step = w / (n - 1), off = n - data.length;
   g.beginPath();
   data.forEach((v, i) => { const x = (i + off) * step, y = h - 2 - ((v || 0) / top) * (h - 4); i ? g.lineTo(x, y) : g.moveTo(x, y); });
   g.strokeStyle = color; g.lineWidth = 1.5; g.stroke();
   g.lineTo((data.length - 1 + off) * step, h); g.lineTo(off * step, h); g.closePath();
-  g.globalAlpha = .12; g.fillStyle = color; g.fill();
+  g.globalAlpha = .12; g.fillStyle = color; g.fill(); g.globalAlpha = 1;
+  if (limit != null) {
+    const y = h - 2 - (limit / top) * (h - 4);
+    g.setLineDash([4, 4]); g.strokeStyle = css('--bad'); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke(); g.setLineDash([]);
+  }
 }
 
 function render(s) {
@@ -1025,6 +1155,18 @@ function render(s) {
   const task = $('task');
   task.textContent = s.task && s.task.message ? s.task.message : (st !== 'stopped' && !srv.console ? 'Console not available: start the server from here (or in a screen named "mc") to control it.' : '');
   task.style.color = s.task && !s.task.ok ? css('--bad') : '';
+
+  const tk = srv.ticks;
+  const tpsNow = tk && tk.tps ? tk.tps[0] : null, msNow = tk && tk.mspt ? tk.mspt.avg : null;
+  $('tps').textContent = tpsNow != null ? tpsNow.toFixed(1) : '–';
+  $('tps').style.color = tpsNow == null ? '' : tpsNow >= 19.5 ? css('--good') : tpsNow >= 17 ? css('--warn') : css('--bad');
+  $('mspt').textContent = msNow != null ? msNow.toFixed(1) : '–';
+  $('mspt').style.color = msNow == null ? '' : msNow < 40 ? css('--good') : msNow < 50 ? css('--warn') : css('--bad');
+  $('tpsAvg').textContent = tk && tk.tps ? tk.tps.map(v => v.toFixed(1)).join(' / ') : '–';
+  $('msptRange').textContent = tk && tk.mspt ? `${tk.mspt.min.toFixed(1)} / ${tk.mspt.max.toFixed(1)} ms` : '–';
+  $('tickNote').textContent = st === 'running' && !tk ? 'Restart the server once from here to turn on TPS tracking.' : '';
+  spark('sparkMspt', s.history.mspt, 50, css('--accent'), 50);
+  spark('sparkTps', s.history.tps, 20, css('--good'));
 
   const cpu = s.cpu, t = s.temps;
   $('cpuPct').textContent = cpu.total.toFixed(0) + '%';
