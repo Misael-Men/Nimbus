@@ -1,0 +1,5 @@
+name: AdaptiveDistance
+version: 1.0.0
+main: dev.nimbus.adaptive.AdaptiveDistance
+api-version: '1.21'
+description: Lowers simulation/view distance under lag and restores it when the server recovers.
